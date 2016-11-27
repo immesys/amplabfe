@@ -1,45 +1,63 @@
 package main
 
 import (
+	"fmt"
+	"log"
 	"net/http"
-	"sync"
+	"strconv"
 	"time"
-
-	"github.com/bmizerany/pat"
-	"github.com/stretchr/graceful"
 )
 
-type FEHandler struct {
-	mu sync.Mutex
-}
+var qei *QueryEngine
 
-//List sensors
-func (fe *FEHandler) ListSensors(w http.ResponseWriter, r *http.Request) {
-
-}
-
-// /sensors/:uuid/data?from="time"&to="time"&window="time"
+// /sensors/:uuid/data?from="time"&window="time"
 // default 'to' is now
 // default 'from' is now-1day
 // default 'window' is 5 minutes
-func (fe *FEHandler) GetData(w http.ResponseWriter, r *http.Request) {
-
+func GetData(w http.ResponseWriter, r *http.Request) {
+	from := r.URL.Query().Get("from")
+	if from == "" {
+		from = fmt.Sprintf("%d", time.Now().Add(-10*time.Minute).UnixNano()/1000000000)
+	}
+	r.Body.Close()
+	fromI, err := strconv.ParseInt(from, 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("BAD 'from' parameter"))
+		return
+	}
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "300"
+	}
+	windowI, err := strconv.ParseInt(window, 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("BAD 'window' parameter"))
+		return
+	}
+	rv, err := qei.GetData(time.Unix(fromI, 0), time.Duration(windowI)*time.Second)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(rv.JsonBytes())
+	r.Body.Close()
 }
 
-// /sensors/:uuid/metadata
-func (fe *FEHandler) GetMetadata(w http.ResponseWriter, r *http.Request) {
-
-}
+/*
+ucberkeley/s.giles/_/i.archiver/slot/query
+ucberkeley/s.giles/_/i.archiver/signal/PXiMHag-J-t9jWXceOkTFyNKGLFoXdTZKcNRZEGlPBE,queries
+*/
 
 func main() {
-	fe := &FEHandler{}
+	qei = NewQueryEngine()
+	//http.Handle("/images/", http.StripPrefix("/images", http.FileServer(http.Dir("/srv/ampimg"))))
+	http.Handle("/data", http.HandlerFunc(GetData))
+	if err := http.ListenAndServe(":9999", nil); err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
 
-	go MaintainState()
-
-	mux := pat.New()
-
-	mux.Get("/list", http.HandlerFunc(fe.ListSensors))
-	mux.Get("/data/:uuid", http.HandlerFunc(fe.GetData))
-	mux.Get("/metadata/:uuid", http.HandlerFunc(fe.GetMetadata))
-	graceful.Run("0.0.0.0:8080", 10*time.Second, mux)
 }
