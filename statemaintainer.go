@@ -3,12 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gtfierro/PunDat/client"
+	"github.com/gtfierro/pundat/archiver"
+	"github.com/immesys/wd"
 	"gopkg.in/immesys/bw2bind.v5"
 )
 
@@ -51,9 +54,13 @@ type StateMap struct {
 	Data         map[string]*SensorState `json:"data"`
 }
 
-var stateMutex sync.RWMutex
-var state *StateMap
-var stateString []byte
+type QueryKey struct {
+	Start  time.Time
+	Length time.Duration
+}
+
+var cacheMutex sync.RWMutex
+var cache map[QueryKey]*StateMap
 
 func (s *StateMap) JsonBytes() []byte {
 	b, _ := json.MarshalIndent(s, " ", " ")
@@ -64,26 +71,46 @@ type QueryEngine struct {
 	bwcl *bw2bind.BW2Client
 	vk   string
 	pd   *client.PundatClient
+	pdm  *client.PundatClient
 }
 
 func NewQueryEngine() *QueryEngine {
+	cache = make(map[QueryKey]*StateMap)
 	rv := QueryEngine{}
 	rv.bwcl = bw2bind.ConnectOrExit("")
 	rv.vk = rv.bwcl.SetEntityFromEnvironOrExit()
 	rv.pd = client.NewPundatClient(rv.bwcl, rv.vk, "ucberkeley")
+	rv.pdm = client.NewPundatClient(rv.bwcl, rv.vk, "scratch.ns")
 	return &rv
 }
 
 func (qe *QueryEngine) GetData(start time.Time, length time.Duration) (*StateMap, error) {
+	key := QueryKey{start, length}
+	cacheMutex.Lock()
+	crv, ok := cache[key]
+	cacheMutex.Unlock()
+	if ok {
+		return crv, nil
+	}
 	res := StateMap{}
 	res.Data = make(map[string]*SensorState)
 	res.WindowStart = start.UnixNano()
 	res.WindowLength = uint64(length.Nanoseconds())
-	qry1 := `select * where has rcoords and building like "Soda Hall" and path like "TwMwEkCRO-Cg3m1RBlgCQUeJPwRttSiLHppLhuHUDeU=/sensors/s.hamilton/.*/i.temperature/signal/operative"`
-	md, _, _, err := qe.pd.Query(qry1)
+	qry1 := `select * where has rcoords and path like "TwMwEkCRO-Cg3m1RBlgCQUeJPwRttSiLHppLhuHUDeU=/sensors/s.hamilton/.*/i.temperature/signal/operative"`
+	md, _, _, err := qe.pdm.Query(qry1)
 	if err != nil {
 		return nil, fmt.Errorf("archiver error: %v\n", err)
 	}
+
+	fmt.Printf("metadata returned %d results\n", len(md.Data))
+	if len(md.Data) > 0 {
+		wd.Kick(os.Getenv("WD_PREFIX")+".archiver.mdq", 600)
+	} else {
+		wd.Fault(os.Getenv("WD_PREFIX")+".archiver.mdq", "no metadata results")
+	}
+	//for _, m := range md.Data {
+	//	fmt.Printf("%s (%s)\n", m.Path, m.Metadata["_name"])
+	//}
 	for _, m := range md.Data {
 		coordsi, ok := m.Metadata["rcoords"]
 		if !ok {
@@ -136,64 +163,93 @@ func (qe *QueryEngine) GetData(start time.Time, length time.Duration) (*StateMap
 			ex.presenceUUID = m.UUID
 		}
 	}
-	//PAR wg := sync.WaitGroup{}
-	//PAR wg.Add(len(res.Data))
+	qry := `select window(%dns) data in (%dns,%dns) where path like "TwMwEkCRO-Cg3m1RBlgCQUeJPwRttSiLHppLhuHUDeU=/sensors/s.hamilton/.*/i.temperature/signal/operative"`
+
+	sqry := fmt.Sprintf(qry, length.Nanoseconds(), start.UnixNano(), start.UnixNano()+length.Nanoseconds())
+	fmt.Printf("sqry is: %s\n", sqry)
+	_, ts, _, err := qe.pd.Query(sqry)
+	if err != nil {
+		return nil, fmt.Errorf("archiver error (phase 2): %v\n", err)
+	}
+	fmt.Printf("data returned %d streams\n", len(ts.Stats))
+	if len(ts.Stats) > 0 {
+		wd.Kick(os.Getenv("WD_PREFIX")+".archiver.dat", 600)
+	} else {
+		wd.Fault(os.Getenv("WD_PREFIX")+".archiver.dat", "got zero results")
+	}
+	getStat := func(uuid string) *archiver.Statistics {
+		for _, el := range ts.Stats {
+			if el.UUID == uuid {
+				return &el
+			}
+		}
+		return nil
+	}
+	ntemp := 0
+	nhum := 0
+
 	for _, sso := range res.Data {
 		ss := sso
-		//PAR go func() (interface{}, interface{}) {
-		qry := `select window(%dns) data in (%dns,%dns) where uuid="%s"`
+
 		if ss.tempUUID != "" {
-			sqry := fmt.Sprintf(qry, length.Nanoseconds(), start.UnixNano(), start.UnixNano()+length.Nanoseconds(), ss.tempUUID)
-			_, ts, _, err := qe.pd.Query(sqry)
-			if err != nil {
-				return nil, fmt.Errorf("archiver error (phase 2): %v\n", err)
+			el := getStat(ss.tempUUID)
+			if el != nil && len(el.Mean) >= 1 {
+				ntemp++
+				ss.TempMin = el.Min[0]
+				ss.TempMean = el.Mean[0]
+				ss.TempMax = el.Max[0]
+				ss.TempCount = el.Count[0]
 			}
-			el := ts.Stats[0]
-			ss.TempMin = el.Min[0]
-			ss.TempMean = el.Mean[0]
-			ss.TempMax = el.Max[0]
-			ss.TempCount = el.Count[0]
 		}
 		if ss.humidityUUID != "" {
-			sqry := fmt.Sprintf(qry, length.Nanoseconds(), start.UnixNano(), start.UnixNano()+length.Nanoseconds(), ss.humidityUUID)
-			_, ts, _, err := qe.pd.Query(sqry)
-			if err != nil {
-				return nil, fmt.Errorf("archiver error (phase 2): %v\n", err)
+			el := getStat(ss.humidityUUID)
+			if el != nil && len(el.Mean) >= 1 {
+				nhum++
+				ss.HumidityMin = el.Min[0]
+				ss.HumidityMean = el.Mean[0]
+				ss.HumidityMax = el.Max[0]
+				ss.HumidityCount = el.Count[0]
 			}
-			el := ts.Stats[0]
-			ss.HumidityMin = el.Min[0]
-			ss.HumidityMean = el.Mean[0]
-			ss.HumidityMax = el.Max[0]
-			ss.HumidityCount = el.Count[0]
 		}
 		if ss.presenceUUID != "" {
-			sqry := fmt.Sprintf(qry, length.Nanoseconds(), start.UnixNano(), start.UnixNano()+length.Nanoseconds(), ss.presenceUUID)
-			_, ts, _, err := qe.pd.Query(sqry)
-			if err != nil {
-				return nil, fmt.Errorf("archiver error (phase 2): %v\n", err)
+			el := getStat(ss.presenceUUID)
+			if el != nil && len(el.Mean) >= 1 {
+				ss.PresenceMean = el.Mean[0]
+				ss.PresenceCount = el.Count[0]
 			}
-			el := ts.Stats[0]
-			ss.PresenceMean = el.Mean[0]
-			ss.PresenceCount = el.Count[0]
-			//fmt.Printf("pd")
 		}
 		if ss.luxUUID != "" {
-			sqry := fmt.Sprintf(qry, length.Nanoseconds(), start.UnixNano(), start.UnixNano()+length.Nanoseconds(), ss.luxUUID)
-			_, ts, _, err := qe.pd.Query(sqry)
-			if err != nil {
-				return nil, fmt.Errorf("archiver error (phase 2): %v\n", err)
+			el := getStat(ss.luxUUID)
+			if el != nil && len(el.Mean) >= 1 {
+				ss.LuxMin = el.Min[0]
+				ss.LuxMean = el.Mean[0]
+				ss.LuxMax = el.Max[0]
+				ss.LuxCount = el.Count[0]
 			}
-			el := ts.Stats[0]
-			ss.LuxMin = el.Min[0]
-			ss.LuxMean = el.Mean[0]
-			ss.LuxMax = el.Max[0]
-			ss.LuxCount = el.Count[0]
 		}
-		//PAR wg.Done()
-		//PAR return nil, nil
-		//PAR }()
 	}
-	//PAR wg.Wait()
+	fmt.Printf("got ntemp=%d and nhum=%d\n", ntemp, nhum)
+	if len(cache) > 1000 {
+		cacheMutex.Lock()
+		i := 0
+		for k, _ := range cache {
+			delete(cache, k)
+			i++
+			if i == 50 {
+				break
+			}
+		}
+		cacheMutex.Unlock()
+	}
+	if start.Before(time.Now().Add(-(length + 3*time.Minute))) {
+		fmt.Println("caching")
+		cacheMutex.Lock()
+		cache[key] = &res
+		cacheMutex.Unlock()
+	} else {
+		fmt.Println("no cache -- too recent")
+	}
+
 	return &res, nil
 }
 

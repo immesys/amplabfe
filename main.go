@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
+
+	"github.com/immesys/wd"
 )
 
 var qei *QueryEngine
@@ -54,6 +57,12 @@ ucberkeley/s.giles/_/i.archiver/signal/PXiMHag-J-t9jWXceOkTFyNKGLFoXdTZKcNRZEGlP
 
 func main() {
 	qei = NewQueryEngine()
+	go func() {
+		for {
+			wd.Kick(os.Getenv("WD_PREFIX")+".running", 300)
+			time.Sleep(100)
+		}
+	}()
 	//http.Handle("/images/", http.StripPrefix("/images", http.FileServer(http.Dir("/srv/ampimg"))))
 	http.Handle("/data", http.HandlerFunc(GetData))
 	if err := http.ListenAndServe(":9999", nil); err != nil {
